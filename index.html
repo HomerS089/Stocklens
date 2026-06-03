@@ -1,0 +1,1053 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>StockLens — Kursanalyse & 100-Tage-Prognose</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;600&display=swap" rel="stylesheet">
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<style>
+  html,body{margin:0;padding:0;background:#06070f;}
+  *{box-sizing:border-box;}
+  #root{min-height:100vh;}
+  .loadmsg{color:#484868;font-family:"IBM Plex Mono",monospace;padding:60px;text-align:center;letter-spacing:.25em;font-size:11px;}
+</style>
+</head>
+<body>
+<div id="root"><div class="loadmsg">STOCKLENS WIRD GELADEN…</div></div>
+<script type="text/babel" data-presets="react">
+const { useState, useCallback, useMemo, useRef, useEffect } = React;
+
+
+// ── PALETTE ──────────────────────────────────────────────────────────────────
+const C = {
+  bg: "#06070f", card: "#0c0d1e", chart: "#070814", border: "#181830",
+  bull: "#00d68f", bear: "#ff3860", text: "#c8c8e8", dim: "#484868",
+  accent: "#e8a020", blue: "#5588ff", purple: "#9966ff",
+  sma20: "#00bcd4", sma50: "#ff9800", sma200: "#e040fb",
+  bbLine: "rgba(100,149,237,0.55)", bbFill: "rgba(100,149,237,0.04)",
+};
+
+// ── TECHNICAL ANALYSIS ───────────────────────────────────────────────────────
+function calcSMA(arr, n) {
+  return arr.map((_, i) => {
+    if (i < n - 1) return null;
+    return arr.slice(i - n + 1, i + 1).reduce((a, b) => a + b, 0) / n;
+  });
+}
+
+function calcBB(closes, n = 20, mult = 2) {
+  const mid = calcSMA(closes, n);
+  return mid.map((m, i) => {
+    if (m === null) return null;
+    const sl = closes.slice(i - n + 1, i + 1);
+    const std = Math.sqrt(sl.reduce((a, b) => a + (b - m) ** 2, 0) / n);
+    return { mid: m, upper: m + mult * std, lower: m - mult * std };
+  });
+}
+
+function calcRSI(closes, n = 14) {
+  const rsi = new Array(closes.length).fill(null);
+  if (closes.length < n + 1) return rsi;
+  const ch = closes.map((c, i) => (i === 0 ? 0 : c - closes[i - 1]));
+  let aG = 0, aL = 0;
+  for (let i = 1; i <= n; i++) {
+    if (ch[i] > 0) aG += ch[i]; else aL -= ch[i];
+  }
+  aG /= n; aL /= n;
+  rsi[n] = 100 - 100 / (1 + (aL === 0 ? Infinity : aG / aL));
+  for (let i = n + 1; i < closes.length; i++) {
+    const g = ch[i] > 0 ? ch[i] : 0, l = ch[i] < 0 ? -ch[i] : 0;
+    aG = (aG * (n - 1) + g) / n; aL = (aL * (n - 1) + l) / n;
+    rsi[i] = 100 - 100 / (1 + (aL === 0 ? Infinity : aG / aL));
+  }
+  return rsi;
+}
+
+function runMonteCarlo(closes, days = 100, sims = 800) {
+  const logR = [];
+  for (let i = 1; i < closes.length; i++) logR.push(Math.log(closes[i] / closes[i - 1]));
+  const mean = logR.reduce((a, b) => a + b, 0) / logR.length;
+  const variance = logR.reduce((a, b) => a + (b - mean) ** 2, 0) / logR.length;
+  const vol = Math.sqrt(variance);
+  const drift = mean - 0.5 * variance;
+  const last = closes[closes.length - 1];
+
+  const dayData = Array.from({ length: days + 1 }, (_, d) => (d === 0 ? [last] : []));
+  for (let s = 0; s < sims; s++) {
+    let p = last;
+    for (let d = 1; d <= days; d++) {
+      const u1 = Math.max(Math.random(), 1e-12), u2 = Math.random();
+      const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+      p = p * Math.exp(drift + vol * z);
+      dayData[d].push(p);
+    }
+  }
+  const pct = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length * p)]; };
+  const percentiles = dayData.map(prices => ({
+    p5: pct(prices, 0.05), p25: pct(prices, 0.25), p50: pct(prices, 0.50),
+    p75: pct(prices, 0.75), p95: pct(prices, 0.95),
+  }));
+  const ends = dayData[days];
+  return {
+    percentiles, annualVol: vol * Math.sqrt(252) * 100,
+    bear: (pct(ends, 0.25) / last - 1) * 100,
+    base: (pct(ends, 0.50) / last - 1) * 100,
+    bull: (pct(ends, 0.75) / last - 1) * 100,
+  };
+}
+
+function detectPatterns(data, sma20, sma50, sma200, rsi) {
+  const pts = [];
+  const n = data.length;
+  if (n < 50) return pts;
+  const closes = data.map(d => d.close);
+  const last = closes[n - 1];
+  const lastRSI = rsi[n - 1];
+
+  // Trend via lin-reg on last 20 candles
+  const rc = closes.slice(-20);
+  const mx = 9.5, my = rc.reduce((a, b) => a + b, 0) / 20;
+  const slope = rc.reduce((a, c, i) => a + (i - mx) * (c - my), 0) /
+    rc.reduce((a, _, i) => a + (i - mx) ** 2, 0);
+  const sp = (slope / my) * 100;
+  if (sp > 0.25) pts.push({ type: "bullish", label: "Aufwärtstrend (20T)", desc: `+${sp.toFixed(2)}%/Tag Steigung` });
+  else if (sp < -0.25) pts.push({ type: "bearish", label: "Abwärtstrend (20T)", desc: `${sp.toFixed(2)}%/Tag Steigung` });
+  else pts.push({ type: "neutral", label: "Seitwärtstrend", desc: "Keine klare Richtung (20T)" });
+
+  // MA position
+  const s20 = sma20[n - 1], s50 = sma50[n - 1], s200 = sma200[n - 1];
+  if (s20 && s50) {
+    const prev20 = sma20[n - 15], prev50 = sma50[n - 15];
+    if (prev20 && prev50) {
+      if (s20 > s50 && prev20 < prev50) pts.push({ type: "bullish", label: "Golden Cross", desc: "SMA20 kreuzte SMA50 aufwärts" });
+      else if (s20 < s50 && prev20 > prev50) pts.push({ type: "bearish", label: "Death Cross", desc: "SMA20 kreuzte SMA50 abwärts" });
+    }
+    if (last > s20 && last > s50) pts.push({ type: "bullish", label: "Kurs über MA20/50", desc: "Bullischer Kontext" });
+    else if (last < s20 && last < s50) pts.push({ type: "bearish", label: "Kurs unter MA20/50", desc: "Bearischer Kontext" });
+  }
+  if (s200) {
+    if (last > s200) pts.push({ type: "bullish", label: "Kurs über SMA200", desc: "Langfristig bullisch" });
+    else pts.push({ type: "bearish", label: "Kurs unter SMA200", desc: "Langfristig bearisch" });
+  }
+
+  // RSI
+  if (lastRSI !== null) {
+    if (lastRSI < 30) pts.push({ type: "bullish", label: `RSI überverkauft (${lastRSI.toFixed(1)})`, desc: "Potenzielle Erholungsrally" });
+    else if (lastRSI > 70) pts.push({ type: "bearish", label: `RSI überkauft (${lastRSI.toFixed(1)})`, desc: "Korrekturrisiko erhöht" });
+    else pts.push({ type: "neutral", label: `RSI neutral (${lastRSI.toFixed(1)})`, desc: "Keine Extremsignale" });
+  }
+
+  // Doppelformation (vereinfacht)
+  const highs60 = data.slice(-60).map(d => d.high);
+  const lows60 = data.slice(-60).map(d => d.low);
+  const mxH = Math.max(...highs60), mnL = Math.min(...lows60);
+  if (highs60.filter(h => h > mxH * 0.985).length >= 2)
+    pts.push({ type: "bearish", label: "Mögl. Doppel-Top", desc: `Widerstand ~${mxH.toFixed(2)}` });
+  if (lows60.filter(l => l < mnL * 1.015).length >= 2)
+    pts.push({ type: "bullish", label: "Mögl. Doppel-Boden", desc: `Unterstützung ~${mnL.toFixed(2)}` });
+
+  return pts;
+}
+
+// ── CSV PARSER (robust: Komma/Semikolon/Tab, DE/EN-Zahlen) ───────────────────
+function parseCSV(text) {
+  const lines = text.trim().split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) throw new Error("CSV zu kurz");
+  let delim = ",";
+  const h0 = lines[0];
+  if ((h0.match(/;/g) || []).length > (h0.match(/,/g) || []).length) delim = ";";
+  else if (h0.includes("\t")) delim = "\t";
+
+  const split = l => l.split(delim).map(c => c.replace(/^["']|["']$/g, "").trim());
+  const header = split(lines[0]).map(h => h.toLowerCase());
+  const col = (...names) => {
+    for (const nm of names) { const i = header.findIndex(h => h.includes(nm)); if (i >= 0) return i; }
+    return -1;
+  };
+  const cD = col("date", "datum", "zeit", "time");
+  const cO = col("open", "eröffn", "eroeffn", "first");
+  const cH = col("high", "hoch", "höch", "hoech");
+  const cL = col("low", "tief", "niedrig");
+  const cC = col("adj close", "close", "schluss", "schluß", "last", "price", "kurs");
+  const cV = col("volume", "volumen", "vol", "stück", "stueck");
+  if ([cD, cO, cH, cL, cC].some(i => i < 0))
+    throw new Error("Spalten nicht erkannt – benötigt: Datum, Open, High, Low, Close");
+
+  const num = s => {
+    if (!s) return NaN;
+    s = s.replace(/\s|[€$£%]/g, "");
+    if (s.includes(",") && s.includes(".")) {
+      s = s.lastIndexOf(",") > s.lastIndexOf(".") ? s.replace(/\./g, "").replace(",", ".") : s.replace(/,/g, "");
+    } else if (s.includes(",")) s = s.replace(",", ".");
+    // K/M/B suffix für Volumen
+    const mul = /k$/i.test(s) ? 1e3 : /m$/i.test(s) ? 1e6 : /b$/i.test(s) ? 1e9 : 1;
+    return parseFloat(s) * mul;
+  };
+
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const c = split(lines[i]);
+    const d = new Date(c[cD]);
+    if (isNaN(d.getTime())) continue;
+    const o = num(c[cO]), hi = num(c[cH]), lo = num(c[cL]), cl = num(c[cC]);
+    if ([o, hi, lo, cl].some(isNaN)) continue;
+    rows.push({ date: d, open: o, high: hi, low: lo, close: cl, volume: cV >= 0 ? (num(c[cV]) || 0) : 0 });
+  }
+  rows.sort((a, b) => a.date - b.date);
+  if (rows.length < 30) throw new Error(`Nur ${rows.length} gültige Zeilen (min. 30 nötig)`);
+  return rows;
+}
+
+// ── Yahoo-Suffix -> Alpha-Vantage-Suffix ─────────────────────────────────────
+function avCandidates(sym) {
+  const m = sym.match(/^(.+)\.([A-Z]+)$/);
+  if (!m) return [sym];
+  const map = { DE: ["DEX", "FRK"], F: ["FRK"], L: ["LON"], PA: ["PAR"], AS: ["AMS"], MI: ["MIL"], SW: ["SWX"], TO: ["TRT"], HK: ["HKG"] };
+  return map[m[2]] ? map[m[2]].map(x => `${m[1]}.${x}`) : [sym];
+}
+
+// ── CANDLESTICK CHART ─────────────────────────────────────────────────────────
+function CandleChart({ data, sma20, sma50, sma200, bb, overlays, width, height = 340 }) {
+  if (!data?.length) return null;
+  const PAD = { t: 8, r: 18, b: 28, l: 62 };
+  const W = width - PAD.l - PAD.r, H = height - PAD.t - PAD.b;
+
+  const maxC = Math.max(2, Math.floor(W / 7));
+  const vis = data.slice(-maxC);
+  const N = vis.length;
+  const spacing = W / N;
+  const cw = Math.max(1.5, spacing * 0.55);
+  const startIdx = data.length - N;
+
+  let mn = Math.min(...vis.map(d => d.low)), mx = Math.max(...vis.map(d => d.high));
+  if (overlays.bb) {
+    const vbb = bb.slice(-maxC).filter(Boolean);
+    if (vbb.length) { mn = Math.min(mn, ...vbb.map(b => b.lower)); mx = Math.max(mx, ...vbb.map(b => b.upper)); }
+  }
+  const pad = (mx - mn) * 0.06;
+  const pMn = mn - pad, pMx = mx + pad;
+
+  const tx = i => PAD.l + (i + 0.5) * spacing;
+  const ty = p => PAD.t + H - ((p - pMn) / (pMx - pMn)) * H;
+  const volMx = Math.max(...vis.map(d => d.volume || 1));
+  const volH = H * 0.14;
+
+  const yTks = Array.from({ length: 6 }, (_, i) => pMn + (pMx - pMn) * i / 5);
+  const xTks = [];
+  for (let i = 0; i < N; i++) {
+    if (i === 0 || vis[i - 1].date.getMonth() !== vis[i].date.getMonth())
+      xTks.push({ i, label: vis[i].date.toLocaleDateString("de-DE", { month: "short", year: "2-digit" }) });
+  }
+
+  const renderLine = (vals, color, sw = 1.2) => {
+    const sliced = vals.slice(startIdx);
+    const segs = []; let cur = [];
+    sliced.forEach((v, i) => {
+      if (v !== null && !isNaN(v)) cur.push(`${tx(i)},${ty(v)}`);
+      else if (cur.length) { segs.push(cur); cur = []; }
+    });
+    if (cur.length) segs.push(cur);
+    return segs.map((s, si) =>
+      <polyline key={si} points={s.join(" ")} fill="none" stroke={color} strokeWidth={sw} strokeLinejoin="round" opacity={0.85} />
+    );
+  };
+
+  const bbSlice = bb.slice(startIdx);
+
+  return (
+    <svg width={width} height={height} style={{ display: "block" }}>
+      <defs>
+        <linearGradient id="chartGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#070814" />
+          <stop offset="100%" stopColor="#050510" />
+        </linearGradient>
+      </defs>
+      <rect x={PAD.l} y={PAD.t} width={W} height={H} fill="url(#chartGrad)" />
+
+      {yTks.map((t, i) => (
+        <g key={i}>
+          <line x1={PAD.l} y1={ty(t)} x2={PAD.l + W} y2={ty(t)} stroke={C.border} strokeWidth={0.5} />
+          <text x={PAD.l - 6} y={ty(t) + 3.5} textAnchor="end" fill={C.dim} fontSize={9} fontFamily="monospace">
+            {t >= 1000 ? t.toFixed(0) : t >= 100 ? t.toFixed(1) : t.toFixed(2)}
+          </text>
+        </g>
+      ))}
+
+      {xTks.map(({ i, label }) => (
+        <g key={i}>
+          <line x1={tx(i)} y1={PAD.t} x2={tx(i)} y2={PAD.t + H} stroke={C.border} strokeWidth={0.4} />
+          <text x={tx(i)} y={PAD.t + H + 18} textAnchor="middle" fill={C.dim} fontSize={8.5} fontFamily="monospace">{label}</text>
+        </g>
+      ))}
+
+      {/* Volume */}
+      {vis.map((d, i) => (
+        <rect key={i} x={tx(i) - cw / 2} y={PAD.t + H - (d.volume / volMx) * volH}
+          width={cw} height={(d.volume / volMx) * volH}
+          fill={d.close >= d.open ? "rgba(0,214,143,0.18)" : "rgba(255,56,96,0.18)"} />
+      ))}
+
+      {/* BB fill */}
+      {overlays.bb && (() => {
+        const up = bbSlice.map((b, i) => b ? `${tx(i)},${ty(b.upper)}` : null).filter(Boolean);
+        const lo = bbSlice.map((b, i) => b ? `${tx(i)},${ty(b.lower)}` : null).filter(Boolean);
+        if (!up.length) return null;
+        return <polygon points={[...up, ...[...lo].reverse()].join(" ")} fill={C.bbFill} />;
+      })()}
+      {overlays.bb && renderLine(bb.map(b => b?.upper), C.bbLine, 0.8)}
+      {overlays.bb && renderLine(bb.map(b => b?.lower), C.bbLine, 0.8)}
+      {overlays.bb && renderLine(bb.map(b => b?.mid), "#6495ed", 0.8)}
+
+      {overlays.sma200 && renderLine(sma200, C.sma200, 1.3)}
+      {overlays.sma50 && renderLine(sma50, C.sma50, 1.3)}
+      {overlays.sma20 && renderLine(sma20, C.sma20, 1.3)}
+
+      {/* Volume Profile (Volumen je Kursniveau) */}
+      {overlays.volprofile && (() => {
+        const BINS = 40, span = pMx - pMn || 1;
+        const bins = new Array(BINS).fill(0);
+        const binOf = p => Math.min(BINS - 1, Math.max(0, Math.floor(((p - pMn) / span) * BINS)));
+        vis.forEach(d => {
+          const lo = binOf(d.low), hi = binOf(d.high), cnt = hi - lo + 1;
+          const per = (d.volume || 0) / cnt;
+          for (let b = lo; b <= hi; b++) bins[b] += per;
+        });
+        const maxBin = Math.max(...bins, 1), poc = bins.indexOf(maxBin);
+        const binH = H / BINS, maxLen = W * 0.24;
+        const pocPrice = pMn + ((poc + 0.5) / BINS) * span, pocY = ty(pocPrice);
+        return (
+          <g>
+            {bins.map((v, b) => {
+              const len = (v / maxBin) * maxLen;
+              if (len < 0.5) return null;
+              const y = PAD.t + H - (b + 1) * binH;
+              return <rect key={b} x={PAD.l + W - len} y={y + 0.4} width={len} height={Math.max(0.6, binH - 0.8)}
+                fill={b === poc ? "rgba(232,160,32,0.55)" : "rgba(123,104,238,0.30)"} />;
+            })}
+            <line x1={PAD.l} y1={pocY} x2={PAD.l + W} y2={pocY} stroke="rgba(232,160,32,0.45)" strokeWidth={0.7} strokeDasharray="2,3" />
+            <text x={PAD.l + W - 3} y={pocY - 3} textAnchor="end" fill={C.accent} fontSize={8} fontFamily="monospace">POC {pocPrice.toFixed(2)}</text>
+          </g>
+        );
+      })()}
+
+      {/* Candles */}
+      {vis.map((d, i) => {
+        const x = tx(i), bull = d.close >= d.open, col = bull ? C.bull : C.bear;
+        const bT = ty(Math.max(d.open, d.close)), bB = ty(Math.min(d.open, d.close));
+        const bH = Math.max(1, bB - bT);
+        return (
+          <g key={i}>
+            <line x1={x} y1={ty(d.high)} x2={x} y2={ty(d.low)} stroke={col} strokeWidth={0.9} />
+            <rect x={x - cw / 2} y={bT} width={cw} height={bH}
+              fill={bull ? "rgba(0,214,143,0.85)" : "rgba(255,56,96,0.85)"} stroke={col} strokeWidth={0.4} />
+          </g>
+        );
+      })}
+
+      {/* Chart border */}
+      <rect x={PAD.l} y={PAD.t} width={W} height={H} fill="none" stroke={C.border} strokeWidth={1} />
+    </svg>
+  );
+}
+
+// ── RSI CHART ─────────────────────────────────────────────────────────────────
+function RSIChart({ rsi, width, height = 82 }) {
+  if (!rsi?.length) return null;
+  const PAD = { t: 4, r: 18, b: 20, l: 62 };
+  const W = width - PAD.l - PAD.r, H = height - PAD.t - PAD.b;
+  const maxC = Math.max(2, Math.floor(W / 7));
+  const vis = rsi.slice(-maxC);
+  const N = vis.length;
+  const sp = W / N;
+  const tx = i => PAD.l + (i + 0.5) * sp;
+  const ty = v => PAD.t + H - (v / 100) * H;
+
+  const segs = []; let cur = [];
+  vis.forEach((v, i) => {
+    if (v !== null && !isNaN(v)) cur.push(`${tx(i)},${ty(v)}`);
+    else if (cur.length) { segs.push(cur); cur = []; }
+  });
+  if (cur.length) segs.push(cur);
+
+  const lastRSI = vis.filter(v => v !== null).pop();
+  const rsiCol = lastRSI < 30 ? C.bull : lastRSI > 70 ? C.bear : C.accent;
+
+  return (
+    <svg width={width} height={height} style={{ display: "block" }}>
+      <rect x={PAD.l} y={PAD.t} width={W} height={H} fill={C.chart} />
+      {[70, 50, 30].map(v => (
+        <line key={v} x1={PAD.l} y1={ty(v)} x2={PAD.l + W} y2={ty(v)}
+          stroke={v === 50 ? C.border : v === 70 ? C.bear : C.bull}
+          strokeWidth={0.6} strokeDasharray={v === 50 ? "4,4" : "3,3"} opacity={0.7} />
+      ))}
+      {segs.map((s, si) =>
+        <polyline key={si} points={s.join(" ")} fill="none" stroke={rsiCol} strokeWidth={1.3} strokeLinejoin="round" />
+      )}
+      {[70, 50, 30].map(v => (
+        <text key={v} x={PAD.l - 6} y={ty(v) + 3.5} textAnchor="end" fill={C.dim} fontSize={8} fontFamily="monospace">{v}</text>
+      ))}
+      <text x={PAD.l - 6} y={PAD.t + H / 2 + 3.5} textAnchor="end" fill={C.dim} fontSize={8} fontFamily="monospace">RSI</text>
+      {lastRSI && <text x={PAD.l + W - 2} y={PAD.t + 10} textAnchor="end" fill={rsiCol} fontSize={8} fontFamily="monospace" fontWeight="700">{lastRSI.toFixed(1)}</text>}
+      <rect x={PAD.l} y={PAD.t} width={W} height={H} fill="none" stroke={C.border} strokeWidth={1} />
+    </svg>
+  );
+}
+
+// ── FORECAST CHART ────────────────────────────────────────────────────────────
+function ForecastChart({ lastPrice, forecast, width, height = 260 }) {
+  if (!forecast || !lastPrice) return null;
+  const { percentiles: ps } = forecast;
+  const N = ps.length;
+  const PAD = { t: 12, r: 82, b: 26, l: 62 };
+  const W = width - PAD.l - PAD.r, H = height - PAD.t - PAD.b;
+
+  const allP = ps.flatMap(p => [p.p5, p.p95]);
+  const mn = Math.min(...allP) * 0.985, mx = Math.max(...allP) * 1.015;
+  const tx = i => PAD.l + (i / (N - 1)) * W;
+  const ty = p => PAD.t + H - ((p - mn) / (mx - mn)) * H;
+
+  const poly5_95 = [...ps.map((p, i) => `${tx(i)},${ty(p.p95)}`), ...[...ps].reverse().map((p, i) => `${tx(N - 1 - i)},${ty(p.p5)}`)].join(" ");
+  const poly25_75 = [...ps.map((p, i) => `${tx(i)},${ty(p.p75)}`), ...[...ps].reverse().map((p, i) => `${tx(N - 1 - i)},${ty(p.p25)}`)].join(" ");
+
+  const yTks = Array.from({ length: 5 }, (_, i) => mn + (mx - mn) * i / 4);
+  const xTks = [0, 20, 40, 60, 80, 100];
+
+  const line = (field, col, sw, dash) => (
+    <polyline points={ps.map((p, i) => `${tx(i)},${ty(p[field])}`).join(" ")} fill="none" stroke={col} strokeWidth={sw} strokeDasharray={dash} />
+  );
+
+  const pLast = ps[100];
+
+  return (
+    <svg width={width} height={height} style={{ display: "block" }}>
+      <rect x={PAD.l} y={PAD.t} width={W} height={H} fill={C.chart} />
+
+      {yTks.map((t, i) => (
+        <g key={i}>
+          <line x1={PAD.l} y1={ty(t)} x2={PAD.l + W} y2={ty(t)} stroke={C.border} strokeWidth={0.5} />
+          <text x={PAD.l - 6} y={ty(t) + 3.5} textAnchor="end" fill={C.dim} fontSize={9} fontFamily="monospace">
+            {t >= 1000 ? t.toFixed(0) : t >= 100 ? t.toFixed(1) : t.toFixed(2)}
+          </text>
+        </g>
+      ))}
+      {xTks.map(t => (
+        <g key={t}>
+          <line x1={tx(t)} y1={PAD.t} x2={tx(t)} y2={PAD.t + H} stroke={C.border} strokeWidth={0.4} />
+          <text x={tx(t)} y={PAD.t + H + 18} textAnchor="middle" fill={C.dim} fontSize={9} fontFamily="monospace">
+            {t === 0 ? "Heute" : `+${t}T`}
+          </text>
+        </g>
+      ))}
+
+      {/* Current price dashed */}
+      <line x1={PAD.l} y1={ty(lastPrice)} x2={PAD.l + W} y2={ty(lastPrice)} stroke="rgba(255,255,255,0.12)" strokeWidth={0.8} strokeDasharray="5,3" />
+      <text x={PAD.l + W + 4} y={ty(lastPrice) + 3.5} fill="rgba(255,255,255,0.3)" fontSize={8} fontFamily="monospace">{lastPrice.toFixed(2)}</text>
+
+      {/* Bands */}
+      <polygon points={poly5_95} fill="rgba(232,160,32,0.07)" />
+      <polygon points={poly25_75} fill="rgba(232,160,32,0.16)" />
+
+      {line("p95", C.accent, 0.6, "4,3")}
+      {line("p75", C.accent, 1.0, "")}
+      {line("p50", C.accent, 2.2, "")}
+      {line("p25", C.accent, 1.0, "")}
+      {line("p5", C.accent, 0.6, "4,3")}
+
+      {/* End labels */}
+      {[
+        { f: "p95", label: `p95 ${pLast.p95.toFixed(2)}`, col: C.bull },
+        { f: "p75", label: `p75 ${pLast.p75.toFixed(2)}`, col: C.bull },
+        { f: "p50", label: `p50 ${pLast.p50.toFixed(2)}`, col: C.accent },
+        { f: "p25", label: `p25 ${pLast.p25.toFixed(2)}`, col: C.bear },
+        { f: "p5", label: `p5  ${pLast.p5.toFixed(2)}`, col: C.bear },
+      ].map(({ f, label, col }) => (
+        <text key={f} x={PAD.l + W + 4} y={ty(pLast[f]) + 3.5} fill={col} fontSize={8} fontFamily="monospace">{label}</text>
+      ))}
+
+      {/* Today marker */}
+      <circle cx={tx(0)} cy={ty(lastPrice)} r={3} fill={C.accent} />
+      <rect x={PAD.l} y={PAD.t} width={W} height={H} fill="none" stroke={C.border} strokeWidth={1} />
+    </svg>
+  );
+}
+
+// ── MAIN APP ──────────────────────────────────────────────────────────────────
+function StockAnalyzer() {
+  const [ticker, setTicker] = useState("AAPL");
+  const [range, setRange] = useState("1y");
+  const [data, setData] = useState(null);
+  const [meta, setMeta] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [overlays, setOverlays] = useState({ sma20: true, sma50: true, sma200: false, bb: false, volprofile: false });
+  const [forecast, setForecast] = useState(null);
+  const [patterns, setPatterns] = useState([]);
+  const [activeTab, setActiveTab] = useState("chart");
+  const [inputMode, setInputMode] = useState("live"); // 'live' | 'csv'
+  const [csvText, setCsvText] = useState("");
+  const [apiKey, setApiKey] = useState(() => { try { return localStorage.getItem("av_key") || ""; } catch { return ""; } });
+  const [fund, setFund] = useState(null);
+  const [fundLoading, setFundLoading] = useState(false);
+  const [fundErr, setFundErr] = useState(null);
+  const [note, setNote] = useState(null);
+  const fileRef = useRef(null);
+  useEffect(() => { try { localStorage.setItem("av_key", apiKey); } catch {} }, [apiKey]);
+  useEffect(() => { setFund(null); setFundErr(null); }, [data]);
+  const containerRef = useRef(null);
+  const [cw, setCw] = useState(820);
+
+  useEffect(() => {
+    const obs = new ResizeObserver(entries => {
+      if (entries[0]) setCw(entries[0].contentRect.width);
+    });
+    if (containerRef.current) obs.observe(containerRef.current);
+    return () => obs.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;600&display=swap";
+    document.head.appendChild(link);
+  }, []);
+
+  const closes = useMemo(() => data?.map(d => d.close) || [], [data]);
+  const sma20 = useMemo(() => calcSMA(closes, 20), [closes]);
+  const sma50 = useMemo(() => calcSMA(closes, 50), [closes]);
+  const sma200 = useMemo(() => calcSMA(closes, 200), [closes]);
+  const bb = useMemo(() => calcBB(closes), [closes]);
+  const rsi = useMemo(() => calcRSI(closes), [closes]);
+
+  useEffect(() => {
+    if (data && sma20.length) setPatterns(detectPatterns(data, sma20, sma50, sma200, rsi));
+  }, [data, sma20]);
+  useEffect(() => {
+    if (activeTab === "fundamental" && data && !fund && !fundLoading && !fundErr && apiKey.trim()) fetchFundamentals();
+  }, [activeTab, data]);
+
+  const fetchData = useCallback(async () => {
+    if (!ticker.trim()) return;
+    setLoading(true); setError(null); setNote(null); setData(null); setForecast(null); setPatterns([]);
+
+    const sym = ticker.trim().toUpperCase();
+    const isUS = !sym.includes(".");
+
+    const RAW = u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`;
+    const CODETABS = u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`;
+    const fetchText = async (url) => { const r = await fetch(url, { signal: AbortSignal.timeout(13000) }); if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); };
+    const fetchViaGet = async (t) => { const r = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(t)}`, { signal: AbortSignal.timeout(13000) }); if (!r.ok) throw new Error(`HTTP ${r.status}`); const j = await r.json(); if (!j.contents) throw new Error("leer"); return j.contents; };
+
+    const DAYS = { "3mo": 95, "6mo": 185, "1y": 370, "2y": 740, "5y": 1850 };
+    const rangeDays = DAYS[range] || 370;
+    const trimTo = (rows) => { const cutoff = Date.now() - rangeDays * 864e5; const t = rows.filter(d => d.date.getTime() >= cutoff); return t.length >= 30 ? t : rows.slice(-Math.min(rows.length, Math.max(120, rows.length))); };
+
+    const fromAV = async () => {
+      if (!apiKey.trim()) throw new Error("kein Key");
+      let e = null;
+      for (const cand of avCandidates(sym)) {
+        try {
+          const res = await fetch(`https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=${encodeURIComponent(cand)}&outputsize=full&apikey=${apiKey.trim()}`, { signal: AbortSignal.timeout(15000) });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const j = await res.json();
+          if (j["Note"] || j["Information"]) throw new Error("AV-Limit/Restriktion");
+          if (j["Error Message"] || !j["Time Series (Daily)"]) { e = new Error(`${cand} n.v.`); continue; }
+          const rows = Object.entries(j["Time Series (Daily)"]).map(([d, o]) => ({ date: new Date(d), open: +o["1. open"], high: +o["2. high"], low: +o["3. low"], close: +o["4. close"], volume: +o["5. volume"] || 0 })).filter(d => !isNaN(d.close)).sort((a, b) => a.date - b.date);
+          return { rows, src: "Alpha Vantage" };
+        } catch (x) { e = x; if (/Limit|Restriktion/.test(x.message)) break; }
+      }
+      throw e || new Error("AV ohne Treffer");
+    };
+
+    const fromStooq = async () => {
+      const sSym = sym.includes(".") ? sym.toLowerCase() : sym.toLowerCase() + ".us";
+      const url = `https://stooq.com/q/d/l/?s=${sSym}&i=d`;
+      let e = null;
+      for (const get of [() => fetchText(RAW(url)), () => fetchViaGet(url), () => fetchText(CODETABS(url))]) {
+        try { const txt = await get(); const h = txt.slice(0, 120); if (!/date/i.test(h) || /no data|exceeded|<html|<!doctype/i.test(h)) throw new Error("kein CSV"); return { rows: parseCSV(txt), src: "Stooq" }; }
+        catch (x) { e = x; }
+      }
+      throw e || new Error("Stooq fehlgeschlagen");
+    };
+
+    const fromYahoo = async () => {
+      const ladder = ["3mo", "6mo", "1y", "2y", "5y"];
+      const tryRanges = ladder.slice(0, ladder.indexOf(range) + 1).reverse();
+      const parseYF = (raw) => { const j = typeof raw === "string" ? JSON.parse(raw) : raw; if (!j.chart || !j.chart.result || !j.chart.result[0]) throw new Error("kein Datensatz"); const r = j.chart.result[0], q = r.indicators.quote[0]; const rows = r.timestamp.map((t, i) => ({ date: new Date(t * 1000), open: q.open[i], high: q.high[i], low: q.low[i], close: q.close[i], volume: q.volume[i] || 0 })).filter(d => d.open && d.high && d.low && d.close && !isNaN(d.close)); if (rows.length < 30) throw new Error("zu wenig"); return rows; };
+      let e = null;
+      for (const rg of (tryRanges.length ? tryRanges : [range])) {
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=${rg}&includePrePost=false`;
+        for (const get of [() => fetchText(RAW(url)), () => fetchViaGet(url), () => fetchText(CODETABS(url))]) {
+          try { const txt = await get(); const head = txt.slice(0, 200); if (head.trimStart().startsWith("<") || /Edge|cloudflare|doctype/i.test(head)) throw new Error("Proxy-Blockseite"); return { rows: parseYF(txt), src: "Yahoo" }; }
+          catch (x) { e = x; }
+        }
+      }
+      throw e || new Error("Yahoo fehlgeschlagen");
+    };
+
+    const order = isUS ? [fromAV, fromStooq, fromYahoo] : [fromStooq, fromYahoo, fromAV];
+    let lastErr = null;
+    for (const src of order) {
+      try {
+        const out = await src();
+        const rows = trimTo(out.rows);
+        if (rows.length < 30) { lastErr = new Error("zu wenig Daten"); continue; }
+        const haveDays = (rows[rows.length - 1].date - rows[0].date) / 864e5;
+        if (haveDays < rangeDays * 0.7) setNote(`${out.src} liefert nur ${rows.length} Handelstage (~${Math.round(haveDays)} Kalendertage) – weniger als der gewählte Zeitraum. Die Analyse nutzt die verfügbare Historie. Mehr Historie bei DE-Aktien meist über Stooq/CSV.`);
+        setData(rows);
+        setMeta({ name: sym, currency: "", exchange: out.src });
+        setForecast(runMonteCarlo(rows.map(d => d.close)));
+        setLoading(false);
+        return;
+      } catch (e) { lastErr = e; }
+    }
+    setError(`Live-Abruf fehlgeschlagen (${lastErr && lastErr.message || "unbekannt"}). Kürzeren Zeitraum (z.B. 1J) wählen, erneut versuchen oder CSV-Modus nutzen.`);
+    setLoading(false);
+  }, [ticker, range, apiKey]);
+
+  const fetchFundamentals = useCallback(async () => {
+    if (!apiKey.trim()) { setFundErr("Fundamentaldaten benötigen einen Alpha-Vantage-Key (Feld oben im Live-Modus)."); return; }
+    if (!ticker.trim()) return;
+    const sym = ticker.trim().toUpperCase();
+    setFundLoading(true); setFundErr(null); setFund(null);
+    let lastErr = null;
+    for (const cand of avCandidates(sym)) {
+      try {
+        const res = await fetch(`https://www.alphavantage.co/query?function=OVERVIEW&symbol=${encodeURIComponent(cand)}&apikey=${apiKey.trim()}`, { signal: AbortSignal.timeout(15000) });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const j = await res.json();
+        if (j["Note"] || j["Information"]) throw new Error("Alpha-Vantage-Limit erreicht (25/Tag)");
+        if (!j || !j.Symbol) { lastErr = new Error(`keine Fundamentaldaten für ${cand}`); continue; }
+        setFund(j); setFundLoading(false); return;
+      } catch (e) { lastErr = e; }
+    }
+    setFundErr((lastErr?.message || "nicht verfügbar") + " — Alpha Vantage liefert für viele Nicht-US-Titel keine Fundamentaldaten.");
+    setFundLoading(false);
+  }, [apiKey, ticker]);
+
+  const loadCSV = useCallback((text, label) => {
+    setError(null); setNote(null); setData(null); setForecast(null); setPatterns([]);
+    try {
+      const raw = parseCSV(text);
+      setData(raw);
+      setMeta({ name: label || ticker.trim().toUpperCase() || "Import", currency: "", exchange: "CSV-Import" });
+      setForecast(runMonteCarlo(raw.map(d => d.close)));
+    } catch (e) {
+      setError(`CSV-Fehler: ${e.message}`);
+    }
+  }, [ticker]);
+
+  const handleFile = useCallback((e) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = ev => loadCSV(String(ev.target.result), f.name.replace(/\.csv$/i, ""));
+    r.readAsText(f);
+  }, [loadCSV]);
+
+  const lastD = data?.[data.length - 1];
+  const prevD = data?.[data.length - 2];
+  const chg = lastD && prevD ? lastD.close - prevD.close : 0;
+  const chgPct = prevD ? (chg / prevD.close) * 100 : 0;
+  const lastRSI = rsi[rsi.length - 1];
+  const lastS20 = sma20[sma20.length - 1];
+  const lastS50 = sma50[sma50.length - 1];
+  const lastS200 = sma200[sma200.length - 1];
+
+  const S = {
+    root: { background: C.bg, minHeight: "100vh", color: C.text, fontFamily: '"IBM Plex Mono", monospace', fontSize: "13px" },
+    hdr: { background: C.card, borderBottom: `1px solid ${C.border}`, padding: "10px 18px", display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" },
+    logo: { fontSize: "11px", fontWeight: 700, color: C.accent, letterSpacing: "0.2em", textTransform: "uppercase", marginRight: "4px", userSelect: "none" },
+    inp: { background: "transparent", border: `1px solid ${C.border}`, color: C.text, fontFamily: "inherit", fontSize: "13px", padding: "5px 9px", width: "90px", outline: "none", borderRadius: "1px", textTransform: "uppercase" },
+    sel: { background: "#0c0d1e", border: `1px solid ${C.border}`, color: C.text, fontFamily: "inherit", fontSize: "12px", padding: "5px 8px", outline: "none", borderRadius: "1px", cursor: "pointer" },
+    btn: { background: C.accent, color: "#000", fontFamily: "inherit", fontSize: "11px", fontWeight: 700, padding: "5px 14px", border: "none", cursor: loading ? "wait" : "pointer", borderRadius: "1px", textTransform: "uppercase", letterSpacing: "0.1em", opacity: loading ? 0.6 : 1 },
+    priceArea: { marginLeft: "auto", display: "flex", alignItems: "center", gap: "18px" },
+    ovBar: { padding: "7px 18px", borderBottom: `1px solid ${C.border}`, display: "flex", gap: "7px", alignItems: "center", background: C.bg },
+    ovBtn: (active, col) => ({ fontSize: "10px", padding: "2px 9px", border: `1px solid ${active ? col : C.border}`, color: active ? col : C.dim, background: "transparent", cursor: "pointer", fontFamily: "inherit", borderRadius: "1px", textTransform: "uppercase", letterSpacing: "0.05em" }),
+    tabs: { padding: "0 18px", borderBottom: `1px solid ${C.border}`, display: "flex", gap: "0" },
+    tab: (active) => ({ padding: "10px 16px", fontSize: "10px", fontWeight: 700, letterSpacing: "0.12em", textTransform: "uppercase", cursor: "pointer", color: active ? C.accent : C.dim, borderBottom: active ? `2px solid ${C.accent}` : "2px solid transparent", background: "transparent", border: "none", borderBottom: active ? `2px solid ${C.accent}` : "2px solid transparent", fontFamily: "inherit" }),
+    statsRow: { padding: "14px 18px", borderBottom: `1px solid ${C.border}`, display: "flex", flexWrap: "wrap", gap: "28px" },
+    statItem: { display: "flex", flexDirection: "column", gap: "3px" },
+    statLabel: { fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.1em" },
+    statVal: { fontSize: "14px", fontWeight: 700 },
+    patternGrid: { display: "flex", flexWrap: "wrap", gap: "8px" },
+    patItem: (type) => ({
+      padding: "7px 11px", borderRadius: "1px", border: `1px solid ${type === "bullish" ? "rgba(0,214,143,0.25)" : type === "bearish" ? "rgba(255,56,96,0.25)" : C.border}`,
+      background: type === "bullish" ? "rgba(0,214,143,0.07)" : type === "bearish" ? "rgba(255,56,96,0.07)" : "rgba(255,255,255,0.03)",
+    }),
+    scGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(130px, 1fr))", gap: "10px" },
+    scCard: (type) => ({ background: C.card, border: `1px solid ${type === "bullish" ? "rgba(0,214,143,0.2)" : type === "bearish" ? "rgba(255,56,96,0.2)" : C.border}`, padding: "12px 14px", borderRadius: "1px" }),
+  };
+
+  const ranges = [["3mo", "3M"], ["6mo", "6M"], ["1y", "1J"], ["2y", "2J"], ["5y", "5J"]];
+  const ovDefs = [
+    { k: "sma20", l: "SMA 20", col: C.sma20 }, { k: "sma50", l: "SMA 50", col: C.sma50 },
+    { k: "sma200", l: "SMA 200", col: C.sma200 }, { k: "bb", l: "Bollinger", col: C.bbLine },
+    { k: "volprofile", l: "Vol-Profil", col: C.purple },
+  ];
+
+  const pLast = forecast?.percentiles[100];
+
+  return (
+    <div style={S.root}>
+      {/* HEADER */}
+      <div style={S.hdr}>
+        <span style={S.logo}>◈ StockLens</span>
+
+        {/* Mode toggle */}
+        <div style={{ display: "flex", border: `1px solid ${C.border}`, borderRadius: "1px", overflow: "hidden" }}>
+          {[["live", "Live"], ["csv", "CSV"]].map(([m, l]) => (
+            <button key={m} onClick={() => { setInputMode(m); setError(null); }}
+              style={{ fontSize: "10px", padding: "5px 11px", border: "none", cursor: "pointer", fontFamily: "inherit",
+                background: inputMode === m ? C.accent : "transparent", color: inputMode === m ? "#000" : C.dim,
+                fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase" }}>{l}</button>
+          ))}
+        </div>
+
+        {inputMode === "live" ? (
+          <>
+            <input style={S.inp} value={ticker} onChange={e => setTicker(e.target.value.toUpperCase())}
+              onKeyDown={e => e.key === "Enter" && fetchData()} placeholder="TICKER" />
+            <div style={{ display: "flex", gap: "4px" }}>
+              {ranges.map(([v, l]) => (
+                <button key={v} style={{ ...S.ovBtn(range === v, C.accent), padding: "4px 8px" }}
+                  onClick={() => setRange(v)}>{l}</button>
+              ))}
+            </div>
+            <input style={{ ...S.inp, width: "150px", letterSpacing: "0.05em" }} value={apiKey}
+              onChange={e => setApiKey(e.target.value)} placeholder="ALPHA-VANTAGE KEY"
+              title="Kostenloser Key: alphavantage.co/support — wird lokal gespeichert" />
+            <button style={S.btn} onClick={fetchData} disabled={loading}>
+              {loading ? "●●●" : "Analyse starten"}
+            </button>
+          </>
+        ) : (
+          <>
+            <input style={{ ...S.inp, width: "120px" }} value={ticker} onChange={e => setTicker(e.target.value.toUpperCase())}
+              placeholder="NAME (optional)" />
+            <input ref={fileRef} type="file" accept=".csv,.txt" onChange={handleFile} style={{ display: "none" }} />
+            <button style={S.btn} onClick={() => fileRef.current?.click()}>CSV-Datei wählen</button>
+            <button style={{ ...S.ovBtn(false, C.dim), padding: "5px 11px" }}
+              onClick={() => csvText.trim() ? loadCSV(csvText, ticker) : setError("Bitte CSV-Text einfügen.")}>
+              Text einlesen
+            </button>
+          </>
+        )}
+
+        {meta && (
+          <div style={S.priceArea}>
+            <div>
+              <div style={{ fontSize: "9px", color: C.dim, letterSpacing: "0.1em" }}>{meta.exchange}</div>
+              <div style={{ color: C.accent, fontWeight: 700, fontSize: "12px" }}>{meta.name}</div>
+            </div>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: "20px", fontWeight: 700 }}>{lastD?.close?.toFixed(2)}<span style={{ fontSize: "10px", color: C.dim, marginLeft: "4px" }}>{meta.currency}</span></div>
+              <div style={{ fontSize: "12px", color: chgPct >= 0 ? C.bull : C.bear, fontWeight: 700 }}>
+                {chgPct >= 0 ? "▲" : "▼"} {Math.abs(chgPct).toFixed(2)}%
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {error && (
+        <div style={{ padding: "16px 18px", color: C.bear, fontSize: "11px", borderBottom: `1px solid ${C.border}` }}>
+          ⚠ {error}
+        </div>
+      )}
+
+      {note && !error && (
+        <div style={{ padding: "10px 18px", color: C.accent, fontSize: "11px", borderBottom: `1px solid ${C.border}`, background: "rgba(232,160,32,0.06)", lineHeight: 1.5 }}>
+          ⓘ {note}
+        </div>
+      )}
+
+      {loading && (
+        <div style={{ padding: "60px", textAlign: "center", color: C.dim, fontSize: "11px", letterSpacing: "0.25em" }}>
+          LADE MARKTDATEN...
+        </div>
+      )}
+
+      {!data && !loading && !error && inputMode === "live" && (
+        <div style={{ padding: "80px 18px", textAlign: "center" }}>
+          <div style={{ fontSize: "10px", color: C.dim, letterSpacing: "0.2em", marginBottom: "14px", textTransform: "uppercase" }}>
+            Ticker eingeben → Analyse starten
+          </div>
+          <div style={{ display: "flex", gap: "10px", justifyContent: "center", flexWrap: "wrap" }}>
+            {["AAPL", "MSFT", "NVDA", "SAP.DE", "BMW.DE", "TSLA", "AMZN", "BTC-USD"].map(t => (
+              <button key={t} style={{ ...S.ovBtn(false, C.dim), padding: "4px 10px", cursor: "pointer" }}
+                onClick={() => setTicker(t)}>{t}</button>
+            ))}
+          </div>
+          <div style={{ fontSize: "9px", color: C.dim, opacity: 0.6, marginTop: "24px", lineHeight: 1.7 }}>
+            Funktioniert „Live" nicht (Netzwerk gesperrt)? → Auf <strong style={{ color: C.accent }}>CSV</strong> umschalten.
+          </div>
+        </div>
+      )}
+
+      {!data && !loading && inputMode === "csv" && (
+        <div style={{ padding: "26px 18px" }}>
+          <div style={{ fontSize: "9px", color: C.dim, letterSpacing: "0.15em", marginBottom: "14px", textTransform: "uppercase" }}>
+            CSV mit Tagesdaten importieren
+          </div>
+          <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: "2px", padding: "14px 16px", marginBottom: "16px", fontSize: "11px", color: C.dim, lineHeight: 1.8 }}>
+            <strong style={{ color: C.text }}>So bekommst du die CSV:</strong><br />
+            1. Yahoo Finance → Aktie suchen → Reiter <em>„Historical Data"</em> → Zeitraum + <em>Daily</em> → <em>Download</em><br />
+            2. Oder Investing.com / dein Broker → Historische Kurse exportieren<br />
+            <span style={{ color: C.dim }}>Erkannte Spalten: Datum, Open, High, Low, Close, Volume — Komma/Semikolon/Tab & DE/EN-Zahlen werden automatisch verarbeitet.</span>
+          </div>
+          <textarea value={csvText} onChange={e => setCsvText(e.target.value)}
+            placeholder={"Date,Open,High,Low,Close,Adj Close,Volume\n2024-01-02,187.15,188.44,183.89,185.64,185.10,82488700\n..."}
+            style={{ width: "100%", height: "180px", background: C.chart, border: `1px solid ${C.border}`,
+              color: C.text, fontFamily: "inherit", fontSize: "11px", padding: "12px", outline: "none",
+              borderRadius: "2px", resize: "vertical", boxSizing: "border-box" }} />
+          <div style={{ display: "flex", gap: "10px", marginTop: "12px" }}>
+            <button style={S.btn} onClick={() => csvText.trim() ? loadCSV(csvText, ticker) : setError("Bitte CSV-Text einfügen.")}>Text einlesen</button>
+            <button style={{ ...S.ovBtn(false, C.accent), padding: "5px 12px" }} onClick={() => fileRef.current?.click()}>…oder Datei wählen</button>
+          </div>
+        </div>
+      )}
+
+      {data && (
+        <>
+          {/* OVERLAY CONTROLS */}
+          <div style={S.ovBar}>
+            <span style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", marginRight: "4px" }}>Overlays</span>
+            {ovDefs.map(({ k, l, col }) => (
+              <button key={k} style={S.ovBtn(overlays[k], col)}
+                onClick={() => setOverlays(o => ({ ...o, [k]: !o[k] }))}>{l}</button>
+            ))}
+          </div>
+
+          {/* TABS */}
+          <div style={S.tabs}>
+            {[["chart", "Kursdiagramm"], ["forecast", "100-Tage-Prognose"], ["patterns", "Muster & Signale"], ["fundamental", "Fundamental"]].map(([id, label]) => (
+              <button key={id} style={S.tab(activeTab === id)} onClick={() => setActiveTab(id)}>{label}</button>
+            ))}
+          </div>
+
+          {/* CHART TAB */}
+          {activeTab === "chart" && (
+            <div ref={containerRef} style={{ background: C.bg }}>
+              <CandleChart data={data} sma20={sma20} sma50={sma50} sma200={sma200} bb={bb} overlays={overlays} width={cw} height={340} />
+              <div style={{ borderTop: `1px solid ${C.border}` }}>
+                <RSIChart rsi={rsi} width={cw} height={82} />
+              </div>
+            </div>
+          )}
+
+          {/* FORECAST TAB */}
+          {activeTab === "forecast" && (
+            <div ref={activeTab === "forecast" ? containerRef : undefined} style={{ background: C.bg }}>
+              <div style={{ padding: "12px 18px 4px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "8px" }}>
+                <div style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.12em" }}>
+                  Monte Carlo · 800 Pfade · Log-Normal · Hist. Volatilität
+                </div>
+                <div style={{ display: "flex", gap: "18px", fontSize: "11px" }}>
+                  {forecast && [
+                    { l: "Bear (p25)", v: forecast.bear, col: C.bear },
+                    { l: "Base (p50)", v: forecast.base, col: C.accent },
+                    { l: "Bull (p75)", v: forecast.bull, col: C.bull },
+                  ].map(({ l, v, col }) => (
+                    <span key={l} style={{ color: col }}>
+                      {l}: <strong>{v >= 0 ? "+" : ""}{v.toFixed(1)}%</strong>
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <div ref={activeTab !== "forecast" ? containerRef : undefined}>
+                <ForecastChart lastPrice={lastD?.close} forecast={forecast} width={cw} height={270} />
+              </div>
+
+              {/* Scenario cards */}
+              {pLast && (
+                <div style={{ padding: "16px 18px", borderTop: `1px solid ${C.border}` }}>
+                  <div style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: "12px" }}>
+                    Kursszenarien in 100 Handelstagen (≈ 5 Monate)
+                  </div>
+                  <div style={S.scGrid}>
+                    {[
+                      { label: "Extremer Bär", sub: "p5", price: pLast.p5, type: "bearish" },
+                      { label: "Bear Case", sub: "p25", price: pLast.p25, type: "bearish" },
+                      { label: "Base Case", sub: "p50 · Median", price: pLast.p50, type: "neutral" },
+                      { label: "Bull Case", sub: "p75", price: pLast.p75, type: "bullish" },
+                      { label: "Extremer Bull", sub: "p95", price: pLast.p95, type: "bullish" },
+                    ].map(({ label, sub, price, type }) => {
+                      const ret = (price / lastD.close - 1) * 100;
+                      return (
+                        <div key={label} style={S.scCard(type)}>
+                          <div style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.05em" }}>{label}</div>
+                          <div style={{ fontSize: "9px", color: C.dim, marginTop: "1px", marginBottom: "8px" }}>{sub}</div>
+                          <div style={{ fontSize: "20px", fontWeight: 700, color: type === "bullish" ? C.bull : type === "bearish" ? C.bear : C.accent }}>
+                            {ret >= 0 ? "+" : ""}{ret.toFixed(1)}%
+                          </div>
+                          <div style={{ fontSize: "11px", color: C.dim, marginTop: "3px" }}>~{price.toFixed(2)} {meta?.currency}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div style={{ marginTop: "16px", fontSize: "9px", color: C.dim, lineHeight: "1.7", borderTop: `1px solid ${C.border}`, paddingTop: "10px" }}>
+                    ⚠ Hinweis: Monte-Carlo-Simulation basiert auf historischer Volatilität und Log-Normal-Verteilung der Renditen. 
+                    Tail-Risiken (Schwarze Schwäne, Gaps, Halts), Makro-Events und fundamentale Änderungen sind NICHT modelliert. 
+                    Jährliche Volatilität: <strong style={{ color: C.text }}>{forecast?.annualVol.toFixed(1)}%</strong>. 
+                    Keine Anlageberatung. Alle Szenarien sind statistische Schätzungen.
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* PATTERNS TAB */}
+          {activeTab === "patterns" && (
+            <div style={{ padding: "18px" }}>
+              <div style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: "14px" }}>
+                Automatisch erkannte Muster & technische Signale (Stand: {lastD?.date?.toLocaleDateString("de-DE")})
+              </div>
+              <div style={S.patternGrid}>
+                {patterns.map((p, i) => (
+                  <div key={i} style={S.patItem(p.type)}>
+                    <div style={{ fontSize: "11px", fontWeight: 700, color: p.type === "bullish" ? C.bull : p.type === "bearish" ? C.bear : C.dim, marginBottom: "3px" }}>
+                      {p.type === "bullish" ? "▲ " : p.type === "bearish" ? "▼ " : "◆ "}{p.label}
+                    </div>
+                    <div style={{ fontSize: "10px", color: C.dim }}>{p.desc}</div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Key levels */}
+              <div style={{ marginTop: "22px", borderTop: `1px solid ${C.border}`, paddingTop: "18px" }}>
+                <div style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: "12px" }}>Schlüssellevels & Indikatoren</div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: "10px" }}>
+                  {[
+                    { label: "Letzter Kurs", val: lastD?.close?.toFixed(2), col: C.text },
+                    { label: "RSI (14)", val: lastRSI?.toFixed(1), col: lastRSI < 30 ? C.bull : lastRSI > 70 ? C.bear : C.text },
+                    { label: "SMA 20", val: lastS20?.toFixed(2), col: lastD?.close > lastS20 ? C.bull : C.bear },
+                    { label: "SMA 50", val: lastS50?.toFixed(2), col: lastD?.close > lastS50 ? C.bull : C.bear },
+                    { label: "SMA 200", val: lastS200?.toFixed(2) || "n.v.", col: lastS200 ? (lastD?.close > lastS200 ? C.bull : C.bear) : C.dim },
+                    { label: "Hist. Vol. (ann.)", val: forecast ? `${forecast.annualVol.toFixed(1)}%` : "—", col: C.text },
+                    { label: "52W Hoch", val: Math.max(...data.map(d => d.high)).toFixed(2), col: C.text },
+                    { label: "52W Tief", val: Math.min(...data.map(d => d.low)).toFixed(2), col: C.text },
+                  ].map(({ label, val, col }) => (
+                    <div key={label} style={{ background: C.card, border: `1px solid ${C.border}`, padding: "10px 12px", borderRadius: "1px" }}>
+                      <div style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.07em", marginBottom: "5px" }}>{label}</div>
+                      <div style={{ fontSize: "15px", fontWeight: 700, color: col }}>{val || "—"}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ marginTop: "18px", fontSize: "9px", color: C.dim, lineHeight: "1.7", borderTop: `1px solid ${C.border}`, paddingTop: "10px" }}>
+                ⚠ Technische Analyse ≠ Kursprognose. Muster sind historische Beobachtungen und liefern keine Handelsempfehlungen.
+                Falsch-positive Signale sind häufig. Immer mit Fundamentalanalyse kombinieren.
+              </div>
+            </div>
+          )}
+
+          {/* FUNDAMENTAL TAB */}
+          {activeTab === "fundamental" && (
+            <div style={{ padding: "18px" }}>
+              {!apiKey.trim() && (
+                <div style={{ fontSize: "11px", color: C.bear }}>Fundamentaldaten benötigen einen Alpha-Vantage-Key (Feld oben im Live-Modus eintragen).</div>
+              )}
+              {apiKey.trim() && fundLoading && (
+                <div style={{ fontSize: "11px", color: C.dim, letterSpacing: "0.2em" }}>LADE FUNDAMENTALDATEN…</div>
+              )}
+              {apiKey.trim() && fundErr && !fundLoading && (
+                <div style={{ fontSize: "11px", color: C.bear, lineHeight: 1.6 }}>
+                  ⚠ {fundErr}
+                  <button style={{ ...S.ovBtn(false, C.accent), marginLeft: "10px" }} onClick={fetchFundamentals}>Erneut</button>
+                </div>
+              )}
+              {fund && !fundLoading && (() => {
+                const nv = v => (v && v !== "None" && v !== "-" && v !== "0" ? +v : NaN);
+                const pct = v => { const x = nv(v); return isNaN(x) ? "n.v." : `${(x * 100).toFixed(1)}%`; };
+                const num = (v, d = 2) => { const x = nv(v); return isNaN(x) ? "n.v." : x.toFixed(d); };
+                const big = v => { const x = nv(v); if (isNaN(x)) return "n.v."; if (x >= 1e9) return (x / 1e9).toFixed(1) + " Mrd"; if (x >= 1e6) return (x / 1e6).toFixed(1) + " Mio"; return x.toFixed(0); };
+                const cur = fund.Currency || meta?.currency || "";
+                const groups = [
+                  { g: "Bewertung", items: [
+                    { l: "KGV (P/E)", v: num(fund.PERatio), hint: "Marktschnitt ≈ 15–20" },
+                    { l: "Forward KGV", v: num(fund.ForwardPE) },
+                    { l: "PEG", v: num(fund.PEGRatio), hint: "<1 = günstig ggü. Wachstum" },
+                    { l: "KBV (P/B)", v: num(fund.PriceToBookRatio) },
+                    { l: "KUV (P/S)", v: num(fund.PriceToSalesRatioTTM) },
+                    { l: "EV/EBITDA", v: num(fund.EVToEBITDA) },
+                  ] },
+                  { g: "Profitabilität", items: [
+                    { l: "Gewinnmarge", v: pct(fund.ProfitMargin) },
+                    { l: "Operative Marge", v: pct(fund.OperatingMarginTTM) },
+                    { l: "ROE", v: pct(fund.ReturnOnEquityTTM), hint: ">15% gilt als stark" },
+                    { l: "ROA", v: pct(fund.ReturnOnAssetsTTM) },
+                  ] },
+                  { g: "Wachstum (YoY)", items: [
+                    { l: "Umsatz", v: pct(fund.QuarterlyRevenueGrowthYOY) },
+                    { l: "Gewinn", v: pct(fund.QuarterlyEarningsGrowthYOY) },
+                  ] },
+                  { g: "Dividende & Risiko", items: [
+                    { l: "Div.-Rendite", v: pct(fund.DividendYield) },
+                    { l: "Beta", v: num(fund.Beta), hint: ">1 = schwankt stärker als Markt" },
+                    { l: "EPS", v: num(fund.EPS) },
+                    { l: "Analystenziel", v: num(fund.AnalystTargetPrice) },
+                  ] },
+                ];
+                return (
+                  <div>
+                    <div style={{ marginBottom: "16px" }}>
+                      <div style={{ fontSize: "15px", fontWeight: 700, color: C.accent }}>{fund.Name || fund.Symbol}</div>
+                      <div style={{ fontSize: "10px", color: C.dim, marginTop: "3px" }}>
+                        {[fund.Exchange, fund.Sector, fund.Industry].filter(Boolean).join(" · ")}
+                        {fund.MarketCapitalization ? ` · Marktkap.: ${big(fund.MarketCapitalization)} ${cur}` : ""}
+                      </div>
+                    </div>
+                    {groups.map(({ g, items }) => (
+                      <div key={g} style={{ marginBottom: "16px" }}>
+                        <div style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: "8px" }}>{g}</div>
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: "10px" }}>
+                          {items.map(({ l, v, hint }) => (
+                            <div key={l} style={{ background: C.card, border: `1px solid ${C.border}`, padding: "10px 12px", borderRadius: "1px" }}>
+                              <div style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: "5px" }}>{l}</div>
+                              <div style={{ fontSize: "16px", fontWeight: 700, color: v === "n.v." ? C.dim : C.text }}>{v}</div>
+                              {hint && <div style={{ fontSize: "8px", color: C.dim, marginTop: "3px" }}>{hint}</div>}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                    <div style={{ marginTop: "14px", fontSize: "9px", color: C.dim, lineHeight: 1.7, borderTop: `1px solid ${C.border}`, paddingTop: "10px" }}>
+                      ⚠ Kennzahlen sind nachlaufend (TTM bzw. letzter Bericht) und teils geschätzt. „n.v.“ = von Alpha Vantage nicht geliefert (bei Nicht-US-Titeln häufig). Quelle: Alpha Vantage Fundamental Data. Kein Anlageberatung.
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+
+          {/* Stats footer */}
+          <div style={{ ...S.statsRow, borderTop: `1px solid ${C.border}` }}>
+            {[
+              { l: "Datenpunkte", v: data.length.toString() },
+              { l: "Periode", v: `${data[0].date.toLocaleDateString("de-DE")} – ${lastD.date.toLocaleDateString("de-DE")}` },
+              { l: "Quelle", v: meta?.exchange || "—" },
+              { l: "Stand", v: new Date().toLocaleDateString("de-DE") },
+            ].map(({ l, v }) => (
+              <div key={l} style={S.statItem}>
+                <div style={S.statLabel}>{l}</div>
+                <div style={{ fontSize: "11px", color: C.dim }}>{v}</div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<StockAnalyzer />);
+</script>
+</body>
+</html>
