@@ -1,22 +1,14 @@
 <!DOCTYPE html>
-<html lang="de">
-<head>
-<meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<html lang="de"><head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>StockLens — Kursanalyse & 100-Tage-Prognose</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;600&display=swap" rel="stylesheet">
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
-<style>
-  html,body{margin:0;padding:0;background:#06070f;}
-  *{box-sizing:border-box;}
-  #root{min-height:100vh;}
-  .loadmsg{color:#484868;font-family:"IBM Plex Mono",monospace;padding:60px;text-align:center;letter-spacing:.25em;font-size:11px;}
-</style>
-</head>
-<body>
+<style>html,body{margin:0;padding:0;background:#06070f;}*{box-sizing:border-box;}#root{min-height:100vh;}
+.loadmsg{color:#484868;font-family:"IBM Plex Mono",monospace;padding:60px;text-align:center;letter-spacing:.25em;font-size:11px;}</style>
+</head><body>
 <div id="root"><div class="loadmsg">STOCKLENS WIRD GELADEN…</div></div>
 <script type="text/babel" data-presets="react">
 const { useState, useCallback, useMemo, useRef, useEffect } = React;
@@ -475,6 +467,47 @@ function ForecastChart({ lastPrice, forecast, width, height = 260 }) {
   );
 }
 
+// ── InfoTip (Hover-Erkl\u00e4rung) ───────────────────────────────────────────────
+function InfoTip({ text }) {
+  const [show, setShow] = useState(false);
+  return (
+    <span style={{ position: "relative", display: "inline-flex" }}
+      onMouseEnter={() => setShow(true)} onMouseLeave={() => setShow(false)}>
+      <span style={{ cursor: "help", color: C.dim, border: `1px solid ${C.border}`, borderRadius: "50%",
+        width: "12px", height: "12px", display: "inline-flex", alignItems: "center", justifyContent: "center",
+        fontSize: "8px", fontStyle: "italic" }}>i</span>
+      {show && (
+        <span style={{ position: "absolute", bottom: "150%", left: "-8px", zIndex: 60, width: "210px",
+          background: "#161628", border: "1px solid #2a2a45", color: C.text, fontSize: "10px",
+          padding: "8px 10px", borderRadius: "3px", lineHeight: 1.55, boxShadow: "0 6px 20px rgba(0,0,0,0.6)",
+          textTransform: "none", letterSpacing: "normal", fontWeight: 400 }}>
+          {text}
+        </span>
+      )}
+    </span>
+  );
+}
+
+// ── DCF ──────────────────────────────────────────────────────────────────────
+function computeDCF({ fcf, growth, termGrowth, wacc, years, netDebt, shares }) {
+  const g = growth / 100, tg = termGrowth / 100, w = wacc / 100, n = +years || 5;
+  if (!(w > tg) || !(shares > 0)) return null;
+  let pvSum = 0, fv = +fcf || 0;
+  const rows = [];
+  for (let t = 1; t <= n; t++) {
+    fv = fv * (1 + g);
+    const pv = fv / Math.pow(1 + w, t);
+    pvSum += pv;
+    rows.push({ t, fcf: fv, pv });
+  }
+  const terminal = (fv * (1 + tg)) / (w - tg);
+  const pvTerminal = terminal / Math.pow(1 + w, n);
+  const ev = pvSum + pvTerminal;
+  const equity = ev - (+netDebt || 0);
+  const perShare = equity / shares;
+  return { rows, pvSum, terminal, pvTerminal, ev, equity, perShare };
+}
+
 // ── MAIN APP ──────────────────────────────────────────────────────────────────
 function StockAnalyzer() {
   const [ticker, setTicker] = useState("AAPL");
@@ -494,6 +527,11 @@ function StockAnalyzer() {
   const [fundLoading, setFundLoading] = useState(false);
   const [fundErr, setFundErr] = useState(null);
   const [note, setNote] = useState(null);
+  const [dcf, setDcf] = useState({ fcf: 1000, growth: 8, termGrowth: 2.5, wacc: 9, years: 5, netDebt: 0, shares: 100 });
+  const [peerInput, setPeerInput] = useState("");
+  const [peers, setPeers] = useState([]);
+  const [peerLoading, setPeerLoading] = useState(false);
+  const [peerErr, setPeerErr] = useState(null);
   const fileRef = useRef(null);
   useEffect(() => { try { localStorage.setItem("av_key", apiKey); } catch {} }, [apiKey]);
   useEffect(() => { setFund(null); setFundErr(null); }, [data]);
@@ -627,6 +665,50 @@ function StockAnalyzer() {
     setFundErr((lastErr?.message || "nicht verfügbar") + " — Alpha Vantage liefert für viele Nicht-US-Titel keine Fundamentaldaten.");
     setFundLoading(false);
   }, [apiKey, ticker]);
+
+  const loadDcfFromData = useCallback(async () => {
+    if (!apiKey.trim()) { setFundErr("Auto-Laden ben\u00f6tigt einen Alpha-Vantage-Key (funktioniert v.a. f\u00fcr US-Titel)."); return; }
+    const sym = ticker.trim().toUpperCase();
+    setFundLoading(true); setFundErr(null);
+    try {
+      const cand = avCandidates(sym)[0];
+      const q = (fn) => fetch(`https://www.alphavantage.co/query?function=${fn}&symbol=${encodeURIComponent(cand)}&apikey=${apiKey.trim()}`, { signal: AbortSignal.timeout(15000) }).then(r => r.json());
+      const [cf, bs, ov] = await Promise.all([q("CASH_FLOW"), q("BALANCE_SHEET"), fund ? Promise.resolve(fund) : q("OVERVIEW")]);
+      if (cf["Note"] || cf["Information"] || bs["Note"] || bs["Information"]) throw new Error("Alpha-Vantage-Limit erreicht");
+      const cfa = cf.annualReports && cf.annualReports[0];
+      const bsa = bs.annualReports && bs.annualReports[0];
+      if (!cfa || !bsa) throw new Error("keine Bilanz-/Cashflow-Daten (bei Nicht-US-Titeln h\u00e4ufig)");
+      const opCF = +cfa.operatingCashflow || 0;
+      const capex = Math.abs(+cfa.capitalExpenditures || 0);
+      const fcf = (opCF - capex) / 1e6;
+      const debt = (+bsa.shortTermDebt || 0) + (+bsa.longTermDebt || +bsa.longTermDebtNoncurrent || 0);
+      const cash = +bsa.cashAndCashEquivalentsAtCarryingValue || +bsa.cashAndShortTermInvestments || 0;
+      const netDebt = (debt - cash) / 1e6;
+      const shares = (+(ov && ov.SharesOutstanding) || 0) / 1e6;
+      setDcf(d => ({ ...d, fcf: Math.round(fcf), netDebt: Math.round(netDebt), shares: shares > 0 ? Math.round(shares) : d.shares }));
+      setFundLoading(false);
+    } catch (e) { setFundErr(e.message); setFundLoading(false); }
+  }, [apiKey, ticker, fund]);
+
+  const fetchPeers = useCallback(async () => {
+    if (!apiKey.trim()) { setPeerErr("Peer-Vergleich ben\u00f6tigt einen Alpha-Vantage-Key (funktioniert v.a. f\u00fcr US-Titel)."); return; }
+    const syms = peerInput.split(/[,\s]+/).map(x => x.trim().toUpperCase()).filter(Boolean).slice(0, 6);
+    if (!syms.length) { setPeerErr("Bitte Peer-Ticker eingeben (kommagetrennt)."); return; }
+    setPeerLoading(true); setPeerErr(null); setPeers([]);
+    const out = []; let limitHit = false;
+    for (const sy of syms) {
+      try {
+        const cand = avCandidates(sy)[0];
+        const j = await fetch(`https://www.alphavantage.co/query?function=OVERVIEW&symbol=${encodeURIComponent(cand)}&apikey=${apiKey.trim()}`, { signal: AbortSignal.timeout(15000) }).then(r => r.json());
+        if (j["Note"] || j["Information"]) { limitHit = true; break; }
+        if (j && j.Symbol) out.push(j);
+      } catch (e) { /* skip */ }
+    }
+    if (fund && fund.Symbol && !out.find(p => p.Symbol === fund.Symbol)) out.unshift(fund);
+    setPeers(out);
+    setPeerErr(limitHit ? "Alpha-Vantage-Limit erreicht \u2013 nicht alle Peers geladen." : (out.length ? null : "Keine Peer-Daten gefunden (bei Nicht-US-Titeln h\u00e4ufig)."));
+    setPeerLoading(false);
+  }, [apiKey, peerInput, fund]);
 
   const loadCSV = useCallback((text, label) => {
     setError(null); setNote(null); setData(null); setForecast(null); setPatterns([]);
@@ -824,7 +906,7 @@ function StockAnalyzer() {
 
           {/* TABS */}
           <div style={S.tabs}>
-            {[["chart", "Kursdiagramm"], ["forecast", "100-Tage-Prognose"], ["patterns", "Muster & Signale"], ["fundamental", "Fundamental"]].map(([id, label]) => (
+            {[["chart", "Kursdiagramm"], ["forecast", "100-Tage-Prognose"], ["patterns", "Muster & Signale"], ["fundamental", "Fundamental"], ["dcf", "DCF"], ["peers", "Peer-Vergleich"]].map(([id, label]) => (
               <button key={id} style={S.tab(activeTab === id)} onClick={() => setActiveTab(id)}>{label}</button>
             ))}
           </div>
@@ -969,28 +1051,28 @@ function StockAnalyzer() {
                 const cur = fund.Currency || meta?.currency || "";
                 const groups = [
                   { g: "Bewertung", items: [
-                    { l: "KGV (P/E)", v: num(fund.PERatio), hint: "Marktschnitt ≈ 15–20" },
-                    { l: "Forward KGV", v: num(fund.ForwardPE) },
-                    { l: "PEG", v: num(fund.PEGRatio), hint: "<1 = günstig ggü. Wachstum" },
-                    { l: "KBV (P/B)", v: num(fund.PriceToBookRatio) },
-                    { l: "KUV (P/S)", v: num(fund.PriceToSalesRatioTTM) },
-                    { l: "EV/EBITDA", v: num(fund.EVToEBITDA) },
+                    { l: "KGV (P/E)", v: num(fund.PERatio), info: "Kurs-Gewinn-Verhältnis: Kurs geteilt durch Gewinn je Aktie. Sagt, wie viele Jahresgewinne du für die Aktie bezahlst. Marktschnitt ca. 15–20 – niedriger ist tendenziell günstiger, hängt aber stark von Wachstum und Branche ab." },
+                    { l: "Forward KGV", v: num(fund.ForwardPE), info: "Wie das KGV, aber auf Basis der für das nächste Jahr erwarteten Gewinne statt der vergangenen." },
+                    { l: "PEG", v: num(fund.PEGRatio), info: "KGV geteilt durch erwartetes Gewinnwachstum. Setzt die Bewertung ins Verhältnis zum Wachstum. Unter 1 gilt als günstig bewertet." },
+                    { l: "KBV (P/B)", v: num(fund.PriceToBookRatio), info: "Kurs-Buchwert-Verhältnis: Kurs geteilt durch den bilanziellen Eigenkapitalwert je Aktie. Unter 1 = unter Buchwert." },
+                    { l: "KUV (P/S)", v: num(fund.PriceToSalesRatioTTM), info: "Kurs-Umsatz-Verhältnis: Marktkapitalisierung geteilt durch Jahresumsatz. Nützlich, wenn Gewinne (noch) niedrig oder negativ sind." },
+                    { l: "EV/EBITDA", v: num(fund.EVToEBITDA), info: "Unternehmenswert (inkl. Schulden) geteilt durch operatives Ergebnis vor Abschreibungen. Vergleicht Firmen unabhängig von ihrer Kapitalstruktur." },
                   ] },
                   { g: "Profitabilität", items: [
-                    { l: "Gewinnmarge", v: pct(fund.ProfitMargin) },
-                    { l: "Operative Marge", v: pct(fund.OperatingMarginTTM) },
-                    { l: "ROE", v: pct(fund.ReturnOnEquityTTM), hint: ">15% gilt als stark" },
-                    { l: "ROA", v: pct(fund.ReturnOnAssetsTTM) },
+                    { l: "Gewinnmarge", v: pct(fund.ProfitMargin), info: "Nettogewinn in % vom Umsatz – wie viel vom Umsatz am Ende als Gewinn übrig bleibt." },
+                    { l: "Operative Marge", v: pct(fund.OperatingMarginTTM), info: "Operativer Gewinn in % vom Umsatz, also vor Zinsen und Steuern. Zeigt die Effizienz des Kerngeschäfts." },
+                    { l: "ROE", v: pct(fund.ReturnOnEquityTTM), info: "Eigenkapitalrendite: Gewinn im Verhältnis zum Eigenkapital. Über 15% gilt als stark – sehr hohe Werte können aber auch von hoher Verschuldung kommen." },
+                    { l: "ROA", v: pct(fund.ReturnOnAssetsTTM), info: "Gesamtkapitalrendite: Gewinn im Verhältnis zur gesamten Bilanzsumme. Misst, wie effizient alle Vermögenswerte arbeiten." },
                   ] },
                   { g: "Wachstum (YoY)", items: [
-                    { l: "Umsatz", v: pct(fund.QuarterlyRevenueGrowthYOY) },
-                    { l: "Gewinn", v: pct(fund.QuarterlyEarningsGrowthYOY) },
+                    { l: "Umsatz", v: pct(fund.QuarterlyRevenueGrowthYOY), info: "Umsatzwachstum des letzten Quartals gegenüber dem gleichen Quartal des Vorjahres." },
+                    { l: "Gewinn", v: pct(fund.QuarterlyEarningsGrowthYOY), info: "Gewinnwachstum des letzten Quartals gegenüber dem Vorjahresquartal." },
                   ] },
                   { g: "Dividende & Risiko", items: [
-                    { l: "Div.-Rendite", v: pct(fund.DividendYield) },
-                    { l: "Beta", v: num(fund.Beta), hint: ">1 = schwankt stärker als Markt" },
-                    { l: "EPS", v: num(fund.EPS) },
-                    { l: "Analystenziel", v: num(fund.AnalystTargetPrice) },
+                    { l: "Div.-Rendite", v: pct(fund.DividendYield), info: "Jährliche Dividende in % vom aktuellen Kurs. 0%/n.v. = keine Dividende." },
+                    { l: "Beta", v: num(fund.Beta), info: "Schwankung relativ zum Gesamtmarkt. Über 1 = schwankt stärker als der Markt, unter 1 = ruhiger." },
+                    { l: "EPS", v: num(fund.EPS), info: "Gewinn je Aktie (Earnings per Share) – Nettogewinn geteilt durch Aktienanzahl." },
+                    { l: "Analystenziel", v: num(fund.AnalystTargetPrice), info: "Durchschnittliches 12-Monats-Kursziel der Analysten, von Alpha Vantage aggregiert." },
                   ] },
                 ];
                 return (
@@ -1006,11 +1088,12 @@ function StockAnalyzer() {
                       <div key={g} style={{ marginBottom: "16px" }}>
                         <div style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: "8px" }}>{g}</div>
                         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: "10px" }}>
-                          {items.map(({ l, v, hint }) => (
+                          {items.map(({ l, v, info }) => (
                             <div key={l} style={{ background: C.card, border: `1px solid ${C.border}`, padding: "10px 12px", borderRadius: "1px" }}>
-                              <div style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: "5px" }}>{l}</div>
+                              <div style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: "5px", display: "flex", alignItems: "center", gap: "5px" }}>
+                                {l} {info && <InfoTip text={info} />}
+                              </div>
                               <div style={{ fontSize: "16px", fontWeight: 700, color: v === "n.v." ? C.dim : C.text }}>{v}</div>
-                              {hint && <div style={{ fontSize: "8px", color: C.dim, marginTop: "3px" }}>{hint}</div>}
                             </div>
                           ))}
                         </div>
@@ -1024,6 +1107,151 @@ function StockAnalyzer() {
               })()}
             </div>
           )}
+
+          {/* DCF TAB */}
+          {activeTab === "dcf" && (() => {
+            const r = computeDCF(dcf);
+            const price = lastD?.close;
+            const upside = r && price ? (r.perShare / price - 1) * 100 : null;
+            const setF = (k, v) => setDcf(d => ({ ...d, [k]: v === "" ? "" : +v }));
+            const fields = [
+              { k: "fcf", l: "Start-FCF (Mio)", info: "Freier Cashflow des letzten Jahres in Mio = operativer Cashflow minus Investitionen (Capex). Basis der gesamten Projektion." },
+              { k: "growth", l: "Wachstum p.a. (%)", info: "J\u00e4hrliches Wachstum des freien Cashflows in der Projektionsphase." },
+              { k: "years", l: "Projektionsjahre", info: "Anzahl explizit projizierter Jahre, danach folgt der Terminal Value (ewige Rente)." },
+              { k: "termGrowth", l: "Terminal-Wachstum (%)", info: "Ewiges Wachstum nach der Projektionsphase. Muss unter dem Diskontsatz liegen und sollte nahe der langfristigen Wirtschaftswachstumsrate sein (~2%)." },
+              { k: "wacc", l: "Diskontsatz/WACC (%)", info: "Kapitalkosten, mit denen k\u00fcnftige Cashflows abgezinst werden. H\u00f6her = vorsichtiger = niedrigerer fairer Wert." },
+              { k: "netDebt", l: "Nettoschulden (Mio)", info: "Schulden minus Cash. Wird vom Unternehmenswert abgezogen, um den Eigenkapitalwert zu erhalten. Nettocash = negativer Wert." },
+              { k: "shares", l: "Aktien (Mio)", info: "Anzahl ausstehender Aktien in Mio. Eigenkapitalwert geteilt durch Aktien ergibt den fairen Wert je Aktie." },
+            ];
+            const waccs = [-1, -0.5, 0, 0.5, 1].map(d => +(+dcf.wacc + d).toFixed(2));
+            const tgs = [-1, -0.5, 0, 0.5, 1].map(d => +(+dcf.termGrowth + d).toFixed(2));
+            return (
+              <div style={{ padding: "18px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: "8px", marginBottom: "14px" }}>
+                  <div style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.1em" }}>DCF \u2013 Discounted Cashflow (eigene Annahmen)</div>
+                  <button style={{ ...S.ovBtn(false, C.accent), padding: "4px 10px" }} onClick={loadDcfFromData}>Kennzahlen aus Alpha Vantage laden (US)</button>
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: "10px", marginBottom: "18px" }}>
+                  {fields.map(({ k, l, info }) => (
+                    <div key={k} style={{ background: C.card, border: `1px solid ${C.border}`, padding: "10px 12px", borderRadius: "1px" }}>
+                      <div style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.06em", marginBottom: "6px", display: "flex", alignItems: "center", gap: "5px" }}>
+                        {l} <InfoTip text={info} />
+                      </div>
+                      <input type="number" value={dcf[k]} onChange={e => setF(k, e.target.value)}
+                        style={{ width: "100%", background: C.chart, border: `1px solid ${C.border}`, color: C.text, fontFamily: "inherit", fontSize: "15px", fontWeight: 700, padding: "5px 7px", outline: "none", borderRadius: "1px", boxSizing: "border-box" }} />
+                    </div>
+                  ))}
+                </div>
+                {!r && <div style={{ fontSize: "11px", color: C.bear }}>Ung\u00fcltige Annahmen: Diskontsatz muss gr\u00f6\u00dfer als Terminal-Wachstum sein und Aktien &gt; 0.</div>}
+                {r && (
+                  <>
+                    <div style={S.scGrid}>
+                      {[
+                        { l: "Unternehmenswert (EV)", v: `${(r.ev / 1000).toFixed(2)} Mrd`, c: C.text },
+                        { l: "Eigenkapitalwert", v: `${(r.equity / 1000).toFixed(2)} Mrd`, c: C.text },
+                        { l: "Fairer Wert / Aktie", v: r.perShare.toFixed(2), c: C.accent },
+                        { l: "Aktueller Kurs", v: price ? price.toFixed(2) : "\u2014", c: C.text },
+                        { l: "Auf-/Abschlag", v: upside == null ? "\u2014" : `${upside >= 0 ? "+" : ""}${upside.toFixed(1)}%`, c: upside >= 0 ? C.bull : C.bear },
+                      ].map(({ l, v, c }) => (
+                        <div key={l} style={{ background: C.card, border: `1px solid ${C.border}`, padding: "12px 14px", borderRadius: "1px" }}>
+                          <div style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: "6px" }}>{l}</div>
+                          <div style={{ fontSize: "18px", fontWeight: 700, color: c }}>{v}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ marginTop: "20px", fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: "8px" }}>
+                      Sensitivit\u00e4t \u2013 Fairer Wert je Aktie (Zeilen: WACC, Spalten: Terminal-Wachstum)
+                    </div>
+                    <div style={{ overflowX: "auto" }}>
+                      <table style={{ borderCollapse: "collapse", fontSize: "11px", fontFamily: "monospace" }}>
+                        <thead>
+                          <tr>
+                            <th style={{ padding: "5px 9px", color: C.dim, textAlign: "left", borderBottom: `1px solid ${C.border}` }}>WACC / g</th>
+                            {tgs.map(tg => <th key={tg} style={{ padding: "5px 9px", color: C.dim, borderBottom: `1px solid ${C.border}` }}>{tg}%</th>)}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {waccs.map(w => (
+                            <tr key={w}>
+                              <td style={{ padding: "5px 9px", color: C.dim, borderRight: `1px solid ${C.border}` }}>{w}%</td>
+                              {tgs.map(tg => {
+                                const rr = computeDCF({ ...dcf, wacc: w, termGrowth: tg });
+                                const fvv = rr ? rr.perShare : NaN;
+                                const up = fvv && price ? fvv / price - 1 : NaN;
+                                const isBase = w === +dcf.wacc && tg === +dcf.termGrowth;
+                                return <td key={tg} style={{ padding: "5px 9px", textAlign: "right", color: isNaN(up) ? C.dim : up >= 0 ? C.bull : C.bear, background: isBase ? "rgba(232,160,32,0.14)" : "transparent", fontWeight: isBase ? 700 : 400 }}>{isNaN(fvv) ? "\u2014" : fvv.toFixed(0)}</td>;
+                              })}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div style={{ marginTop: "16px", fontSize: "9px", color: C.dim, lineHeight: 1.7, borderTop: `1px solid ${C.border}`, paddingTop: "10px" }}>
+                      \u26a0 Ein DCF reagiert extrem empfindlich auf die Annahmen (v.a. WACC und Terminal-Wachstum) \u2013 siehe Sensitivit\u00e4tstabelle. Er liefert eine Bandbreite, kein exaktes Kursziel. Werte in Mio bzw. Mrd der Bilanzw\u00e4hrung. Kein Anlageberatung.
+                    </div>
+                  </>
+                )}
+              </div>
+            );
+          })()}
+
+          {/* PEER TAB */}
+          {activeTab === "peers" && (() => {
+            const metrics = [
+              { l: "KGV", k: "PERatio" }, { l: "Fwd-KGV", k: "ForwardPE" }, { l: "PEG", k: "PEGRatio" },
+              { l: "KBV", k: "PriceToBookRatio" }, { l: "KUV", k: "PriceToSalesRatioTTM" }, { l: "EV/EBITDA", k: "EVToEBITDA" },
+              { l: "ROE", k: "ReturnOnEquityTTM", pct: true }, { l: "Marge", k: "ProfitMargin", pct: true },
+              { l: "Ums.-Wachstum", k: "QuarterlyRevenueGrowthYOY", pct: true }, { l: "Div.-Rendite", k: "DividendYield", pct: true },
+            ];
+            const val = (p, m) => { const x = +p[m.k]; if (isNaN(x) || p[m.k] === "None" || p[m.k] == null) return NaN; return m.pct ? x * 100 : x; };
+            const fmt = (x, m) => isNaN(x) ? "\u2014" : m.pct ? `${x.toFixed(1)}%` : x.toFixed(1);
+            const median = (m) => { const xs = peers.map(p => val(p, m)).filter(x => !isNaN(x)).sort((a, b) => a - b); if (!xs.length) return NaN; const mid = Math.floor(xs.length / 2); return xs.length % 2 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2; };
+            return (
+              <div style={{ padding: "18px" }}>
+                <div style={{ fontSize: "9px", color: C.dim, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: "12px" }}>Peer-Vergleich \u2013 Multiples nebeneinander</div>
+                <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "16px" }}>
+                  <input value={peerInput} onChange={e => setPeerInput(e.target.value.toUpperCase())}
+                    placeholder="PEER-TICKER, kommagetrennt (z.B. GE, ABB, MMM)"
+                    style={{ ...S.inp, width: "320px", maxWidth: "100%" }} />
+                  <button style={S.btn} onClick={fetchPeers} disabled={peerLoading}>{peerLoading ? "\u25cf\u25cf\u25cf" : "Vergleichen"}</button>
+                </div>
+                {peerErr && <div style={{ fontSize: "11px", color: C.bear, marginBottom: "12px" }}>\u26a0 {peerErr}</div>}
+                {peers.length > 0 && (
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ borderCollapse: "collapse", fontSize: "11px", fontFamily: "monospace", width: "100%" }}>
+                      <thead>
+                        <tr>
+                          <th style={{ padding: "6px 10px", textAlign: "left", color: C.dim, borderBottom: `1px solid ${C.border}` }}>Kennzahl</th>
+                          {peers.map(p => <th key={p.Symbol} style={{ padding: "6px 10px", color: C.accent, borderBottom: `1px solid ${C.border}`, whiteSpace: "nowrap" }}>{p.Symbol}</th>)}
+                          <th style={{ padding: "6px 10px", color: C.dim, borderBottom: `1px solid ${C.border}` }}>Median</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {metrics.map(m => {
+                          const med = median(m);
+                          return (
+                            <tr key={m.k}>
+                              <td style={{ padding: "6px 10px", color: C.text, borderBottom: `1px solid ${C.border}` }}>{m.l}</td>
+                              {peers.map(p => {
+                                const x = val(p, m);
+                                const cheaper = !isNaN(x) && !isNaN(med) && !m.pct && x < med;
+                                const richer = !isNaN(x) && !isNaN(med) && !m.pct && x > med;
+                                return <td key={p.Symbol} style={{ padding: "6px 10px", textAlign: "right", borderBottom: `1px solid ${C.border}`, color: cheaper ? C.bull : richer ? C.bear : C.text }}>{fmt(x, m)}</td>;
+                              })}
+                              <td style={{ padding: "6px 10px", textAlign: "right", borderBottom: `1px solid ${C.border}`, color: C.dim }}>{fmt(med, m)}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                <div style={{ marginTop: "16px", fontSize: "9px", color: C.dim, lineHeight: 1.7, borderTop: `1px solid ${C.border}`, paddingTop: "10px" }}>
+                  Bei Bewertungs-Multiples (KGV, KUV, EV/EBITDA \u2026): gr\u00fcn = unter Peer-Median (relativ g\u00fcnstiger), rot = dar\u00fcber. Das aktuell analysierte Unternehmen wird automatisch erg\u00e4nzt, falls im Fundamental-Tab geladen. Jeder Peer = 1 Alpha-Vantage-Abruf (Tageslimit 25). Funktioniert v.a. f\u00fcr US-Titel. Kein Anlageberatung.
+                </div>
+              </div>
+            );
+          })()}
 
           {/* Stats footer */}
           <div style={{ ...S.statsRow, borderTop: `1px solid ${C.border}` }}>
@@ -1046,8 +1274,5 @@ function StockAnalyzer() {
 }
 
 
-const root = ReactDOM.createRoot(document.getElementById("root"));
-root.render(<StockAnalyzer />);
-</script>
-</body>
-</html>
+ReactDOM.createRoot(document.getElementById("root")).render(<StockAnalyzer />);
+</script></body></html>
